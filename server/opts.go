@@ -384,6 +384,12 @@ type JSLimitOpts struct {
 
 	// Max asset limits
 	DefaultMaxConsumers int `json:"default_max_consumers,omitempty"` // DefaultMaxConsumers is the maximum number of consumers per stream (unless overwritten on the stream) (-1=unlimited)
+
+	MaxConcurrentElections int           `json:"max_concurrent_elections,omitempty"` // MaxConcurrentElections caps how many RAFT groups on this server may be campaigning at once (0 = unlimited)
+	ElectionLease          time.Duration `json:"election_lease,omitempty"`           // ElectionLease is how long a concurrent-election slot is reserved before it's reclaimed, win or lose (0 = minElectionTimeout)
+	ElectionBackoffBase    time.Duration `json:"election_backoff_base,omitempty"`    // ElectionBackoffBase is the initial retry delay applied when a group is denied an election slot
+	ElectionBackoffMax     time.Duration `json:"election_backoff_max,omitempty"`     // ElectionBackoffMax caps how far the retry delay grows for a group repeatedly denied a slot
+	ElectionBackoffJitter  float64       `json:"election_backoff_jitter,omitempty"`  // ElectionBackoffJitter is the jitter factor (0.0-1.0) applied to the retry delay to prevent sync waves
 }
 
 type JSTpmOpts struct {
@@ -2556,6 +2562,28 @@ func parseJetStreamLimits(v any, opts *Options, errors *[]error) error {
 			if err != nil {
 				*errors = append(*errors, err)
 			}
+		case "max_concurrent_elections":
+			opts.JetStreamLimits.MaxConcurrentElections = int(mv.(int64))
+		case "election_lease":
+			var err error
+			opts.JetStreamLimits.ElectionLease, err = time.ParseDuration(mv.(string))
+			if err != nil {
+				*errors = append(*errors, err)
+			}
+		case "election_backoff_base":
+			var err error
+			opts.JetStreamLimits.ElectionBackoffBase, err = time.ParseDuration(mv.(string))
+			if err != nil {
+				*errors = append(*errors, err)
+			}
+		case "election_backoff_max":
+			var err error
+			opts.JetStreamLimits.ElectionBackoffMax, err = time.ParseDuration(mv.(string))
+			if err != nil {
+				*errors = append(*errors, err)
+			}
+		case "election_backoff_jitter":
+			opts.JetStreamLimits.ElectionBackoffJitter = mv.(float64)
 		case "batch":
 			if err := parseJetStreamLimitsBatch(tk, opts, errors); err != nil {
 				return err
@@ -6203,6 +6231,19 @@ func setBaselineOptions(opts *Options) {
 	}
 	if opts.JetStreamLimits.DefaultMaxConsumers == 0 {
 		opts.JetStreamLimits.DefaultMaxConsumers = JSDefaultMaxConsumersPerStream
+	}
+	// JetStream concurrent-election limiting defaults
+	if opts.JetStreamLimits.ElectionLease == 0 {
+		opts.JetStreamLimits.ElectionLease = minElectionTimeout
+	}
+	if opts.JetStreamLimits.ElectionBackoffBase == 0 {
+		opts.JetStreamLimits.ElectionBackoffBase = 50 * time.Millisecond
+	}
+	if opts.JetStreamLimits.ElectionBackoffMax == 0 {
+		opts.JetStreamLimits.ElectionBackoffMax = 8 * time.Second
+	}
+	if opts.JetStreamLimits.ElectionBackoffJitter == 0 {
+		opts.JetStreamLimits.ElectionBackoffJitter = 0.9
 	}
 }
 

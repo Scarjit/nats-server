@@ -255,6 +255,9 @@ type raft struct {
 	lxfer        bool // Are we doing a leadership transfer?
 	hcbehind     bool // Were we falling behind at the last health check? (see: isCurrent)
 	maybeLeader  bool // The group had a preferred leader. And is maybe already acting as leader prior to scale up.
+	isMeta       bool // Whether this is the meta Raft group (bypasses the concurrent-election limiter)
+	electSlot    int  // Index of the concurrent-election slot we hold while Candidate, or -1 if none
+	electDenied  int  // Consecutive times we've been denied a concurrent-election slot; drives backoff escalation
 	paused       bool // Whether or not applies are paused
 	observer     bool // The node is observing, i.e. not able to become leader
 	initializing bool // The node is new, and "empty log" checks can be temporarily relaxed.
@@ -384,6 +387,86 @@ var (
 	errQuorumPossible    = errors.New("raft: remaining peers could still reach quorum")
 )
 
+// electionConcurrencyLimiter bounds how many RAFT groups on this node may be
+// simultaneously campaigning (in the Candidate state) at once.
+//
+// A leaky-bucket rate limiter only throttles how fast new elections are
+// admitted; under sustained goroutine/CPU starvation, admitted elections
+// can't resolve as fast as they're admitted, so the number *in flight* keeps
+// growing even at a fixed admission rate — which is exactly the failure mode
+// this is meant to prevent. Bounding concurrency directly caps the amount of
+// active election work (vote RPCs, retries) competing for the scheduler at
+// any instant, which is the resource actually exhausted.
+//
+// A held slot is identified by its index so its owner can Touch() it to
+// extend the lease on each retry of a still-unresolved candidacy (so a
+// legitimately slow election under load isn't starved by its own slot
+// expiring out from under it) and Release() it as soon as the candidacy
+// resolves. The lease is only a safety net for exit paths that don't call
+// Release (a group being closed or removed mid-candidacy, etc.): it
+// guarantees the limiter can never wedge even if a slot is never explicitly
+// freed, at the cost of that slot sitting idle for up to `lease` afterward.
+type electionConcurrencyLimiter struct {
+	mu     sync.Mutex
+	expiry []time.Time
+	lease  time.Duration
+}
+
+// Acquire reserves one of the limiter's slots for `lease` and returns its
+// index and true, or (-1, false) if every slot is currently leased.
+func (l *electionConcurrencyLimiter) Acquire() (int, bool) {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i, exp := range l.expiry {
+		if now.After(exp) {
+			l.expiry[i] = now.Add(l.lease)
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+// Touch extends the lease on an already-held slot, e.g. because its owner is
+// still actively (re)campaigning and hasn't resolved yet.
+func (l *electionConcurrencyLimiter) Touch(slot int) {
+	if slot < 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if slot < len(l.expiry) {
+		l.expiry[slot] = time.Now().Add(l.lease)
+	}
+}
+
+// Release frees a held slot immediately instead of waiting for its lease to
+// expire, so another group waiting on the limiter can use it right away.
+func (l *electionConcurrencyLimiter) Release(slot int) {
+	if slot < 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if slot < len(l.expiry) {
+		l.expiry[slot] = time.Time{}
+	}
+}
+
+// newElectionConcurrencyLimiter creates a limiter with the given number of
+// concurrent-election slots and per-slot lease duration. Returns nil if
+// maxConcurrent is 0 (unlimited); a non-positive lease falls back to
+// minElectionTimeout.
+func newElectionConcurrencyLimiter(maxConcurrent int, lease time.Duration) *electionConcurrencyLimiter {
+	if maxConcurrent <= 0 {
+		return nil
+	}
+	if lease <= 0 {
+		lease = minElectionTimeout
+	}
+	return &electionConcurrencyLimiter{expiry: make([]time.Time, maxConcurrent), lease: lease}
+}
+
 // This will bootstrap a raftNode by writing its config into the store directory.
 func (s *Server) bootstrapRaftNode(cfg *RaftConfig, knownPeers []string, allPeersKnown bool) error {
 	if cfg == nil {
@@ -473,30 +556,32 @@ func (s *Server) initRaftNode(accName string, cfg *RaftConfig, labels pprofLabel
 
 	qpfx := fmt.Sprintf("[ACC:%s] RAFT '%s' ", accName, cfg.Name)
 	n := &raft{
-		created:  time.Now(),
-		id:       hash[:idLen],
-		group:    cfg.Name,
-		sd:       cfg.Store,
-		wal:      cfg.Log,
-		wtype:    cfg.Log.Type(),
-		dios:     s.diskIOSemaphore(),
-		track:    cfg.Track,
-		managed:  cfg.Managed,
-		peers:    make(map[string]*lps),
-		acks:     make(map[uint64]map[string]struct{}),
-		pae:      make(map[uint64]*appendEntry),
-		s:        s,
-		js:       s.getJetStream(),
-		quit:     make(chan struct{}),
-		reqs:     newIPQueue[*voteRequest](s, qpfx+"vreq"),
-		votes:    newIPQueue[*voteResponse](s, qpfx+"vresp"),
-		prop:     newIPQueue[*proposedEntry](s, qpfx+"entry"),
-		entry:    newIPQueue[*appendEntry](s, qpfx+"appendEntry"),
-		resp:     newIPQueue[*appendEntryResponse](s, qpfx+"appendEntryResponse"),
-		apply:    newIPQueue[*CommittedEntry](s, qpfx+"committedEntry"),
-		accName:  accName,
-		leadc:    make(chan leadChange, 1),
-		observer: cfg.Observer,
+		created:   time.Now(),
+		id:        hash[:idLen],
+		group:     cfg.Name,
+		sd:        cfg.Store,
+		wal:       cfg.Log,
+		wtype:     cfg.Log.Type(),
+		dios:      s.diskIOSemaphore(),
+		track:     cfg.Track,
+		managed:   cfg.Managed,
+		peers:     make(map[string]*lps),
+		acks:      make(map[uint64]map[string]struct{}),
+		pae:       make(map[uint64]*appendEntry),
+		s:         s,
+		js:        s.getJetStream(),
+		quit:      make(chan struct{}),
+		reqs:      newIPQueue[*voteRequest](s, qpfx+"vreq"),
+		votes:     newIPQueue[*voteResponse](s, qpfx+"vresp"),
+		prop:      newIPQueue[*proposedEntry](s, qpfx+"entry"),
+		entry:     newIPQueue[*appendEntry](s, qpfx+"appendEntry"),
+		resp:      newIPQueue[*appendEntryResponse](s, qpfx+"appendEntryResponse"),
+		apply:     newIPQueue[*CommittedEntry](s, qpfx+"committedEntry"),
+		accName:   accName,
+		leadc:     make(chan leadChange, 1),
+		observer:  cfg.Observer,
+		isMeta:    cfg.Name == defaultMetaGroupName,
+		electSlot: -1,
 	}
 
 	if cfg.NewTransport != nil {
@@ -2378,6 +2463,50 @@ func (n *raft) xferCampaign() error {
 	}
 	n.resetElect(10 * time.Millisecond)
 	return nil
+}
+
+// electionRetryDelay returns how long switchToCandidate should wait before
+// re-checking the election concurrency limiter, using the configured backoff
+// base/max/jitter (falling back to sane defaults if unset). `denied` is how
+// many consecutive times this group has been denied a slot: the delay
+// doubles per denial up to max, so a small number of waiting groups retry
+// quickly while a large pile-up of them (e.g. right after a node restart)
+// spreads its own retries out instead of polling the limiter at a constant
+// rate — that polling is itself goroutine/lock traffic competing for the
+// same starved scheduler this is trying to protect.
+//
+// Unlike a blocking retry loop, this is just the duration passed to
+// resetElect: the caller re-arms its own election timer and returns, so a
+// throttled group never blocks its goroutine or holds a lock waiting for a
+// slot.
+func electionRetryDelay(lim JSLimitOpts, denied int) time.Duration {
+	base := lim.ElectionBackoffBase
+	if base <= 0 {
+		base = 50 * time.Millisecond
+	}
+	max := lim.ElectionBackoffMax
+	if max <= 0 {
+		max = 2 * time.Second
+	}
+	jitter := lim.ElectionBackoffJitter
+	if jitter <= 0 {
+		jitter = 0.5
+	}
+
+	backoff := base
+	for i := 0; i < denied && backoff < max; i++ {
+		backoff *= 2
+	}
+	if backoff > max {
+		backoff = max
+	}
+
+	spread := time.Duration(float64(backoff) * jitter)
+	d := backoff + time.Duration(float64(spread)*(rand.Float64()*2-1))
+	if d < time.Millisecond {
+		d = time.Millisecond
+	}
+	return d
 }
 
 // State returns the current state for this node.
@@ -5816,6 +5945,16 @@ func (n *raft) switchToFollowerLocked(leader string) {
 
 	n.debug("Switching to follower")
 
+	// If we were mid-candidacy, free our concurrent-election slot right away
+	// rather than waiting out its lease, so another throttled group can use
+	// it immediately.
+	if n.electSlot >= 0 {
+		if rl := n.s.electionLimiter.Load(); rl != nil {
+			rl.Release(n.electSlot)
+		}
+		n.electSlot = -1
+	}
+
 	n.aflr = 0
 	n.leaderState.Store(false)
 	n.leaderSince.Store(nil)
@@ -5864,8 +6003,44 @@ func (n *raft) switchToCandidate() {
 	}
 
 	if n.State() != Candidate {
+		// Throttle how many groups on this node may *begin* a fresh candidacy
+		// at once. This is the single choke point every path into candidacy
+		// passes through — the initial election when a group is created, an
+		// immediate campaign, and (most importantly under sustained
+		// CPU/goroutine pressure) an ordinary election-timeout firing after a
+		// group falls back to Follower — so a storm of simultaneous timeouts
+		// (e.g. right after a node restart, or thousands of groups losing
+		// their leader together) can't pile up faster than the scheduler can
+		// service them. Once a candidacy is already underway we let it keep
+		// retrying/bumping its term below without re-checking the limiter:
+		// it already holds a slot (touched below), and re-gating every retry
+		// would let brand-new candidacies starve ones already in flight.
+		// Meta is exempt: cluster bootstrap and metadata availability must
+		// never be rate limited. This never blocks: a throttled group just
+		// re-arms its own election timer and retries shortly, same as the
+		// early-return cases above.
+		if !n.isMeta && n.electSlot < 0 {
+			if rl := n.s.electionLimiter.Load(); rl != nil {
+				slot, ok := rl.Acquire()
+				if !ok {
+					n.electDenied++
+					n.resetElect(electionRetryDelay(n.s.getOpts().JetStreamLimits, n.electDenied))
+					return
+				}
+				n.electSlot = slot
+			}
+		}
+		n.electDenied = 0
 		n.debug("Switching to candidate")
 	} else {
+		// Still campaigning for a prior term that timed out without a winner;
+		// extend our held slot's lease so it doesn't expire out from under an
+		// election that's legitimately just taking a while under load.
+		if n.electSlot >= 0 {
+			if rl := n.s.electionLimiter.Load(); rl != nil {
+				rl.Touch(n.electSlot)
+			}
+		}
 		if n.lostQuorumLocked() && time.Since(n.llqrt) > lostQuorumSignal {
 			// We signal to the upper layers such that can alert on quorum lost.
 			n.updateLeadChange(false)
@@ -5891,6 +6066,16 @@ func (n *raft) switchToLeader() {
 	defer n.Unlock()
 
 	n.debug("Switching to leader")
+
+	// Won the election: free our concurrent-election slot right away rather
+	// than waiting out its lease, so another throttled group can use it
+	// immediately.
+	if n.electSlot >= 0 {
+		if rl := n.s.electionLimiter.Load(); rl != nil {
+			rl.Release(n.electSlot)
+		}
+		n.electSlot = -1
+	}
 
 	n.lxfer = false
 	n.updateLeader(n.id)

@@ -8776,3 +8776,106 @@ func TestNRGCachePendingEntryBytesAccounting(t *testing.T) {
 	require_Len(t, len(n.pae), 0)
 	require_Equal(t, n.paeBytes, 0)
 }
+
+func TestNRGElectionConcurrencyLimiterAllowsUpToCapacity(t *testing.T) {
+	limiter := newElectionConcurrencyLimiter(10, time.Minute)
+	require_True(t, limiter != nil)
+
+	for i := 0; i < 10; i++ {
+		_, ok := limiter.Acquire()
+		require_True(t, ok)
+	}
+}
+
+func TestNRGElectionConcurrencyLimiterDeniesWhenExhausted(t *testing.T) {
+	limiter := newElectionConcurrencyLimiter(5, time.Minute)
+
+	for i := 0; i < 5; i++ {
+		_, ok := limiter.Acquire()
+		require_True(t, ok)
+	}
+
+	// Should be denied now
+	for i := 0; i < 10; i++ {
+		_, ok := limiter.Acquire()
+		require_False(t, ok)
+	}
+}
+
+func TestNRGElectionConcurrencyLimiterLeaseExpires(t *testing.T) {
+	limiter := newElectionConcurrencyLimiter(1, 10*time.Millisecond)
+
+	_, ok := limiter.Acquire()
+	require_True(t, ok)
+
+	// Should be denied immediately, before the lease expires.
+	_, ok = limiter.Acquire()
+	require_False(t, ok)
+
+	// Once the lease expires the slot is reclaimed even without a Release.
+	time.Sleep(20 * time.Millisecond)
+	_, ok = limiter.Acquire()
+	require_True(t, ok)
+}
+
+func TestNRGElectionConcurrencyLimiterReleaseIsImmediate(t *testing.T) {
+	limiter := newElectionConcurrencyLimiter(1, time.Minute)
+
+	slot, ok := limiter.Acquire()
+	require_True(t, ok)
+
+	_, ok = limiter.Acquire()
+	require_False(t, ok)
+
+	limiter.Release(slot)
+	_, ok = limiter.Acquire()
+	require_True(t, ok)
+}
+
+func TestNRGElectionConcurrencyLimiterTouchExtendsLease(t *testing.T) {
+	limiter := newElectionConcurrencyLimiter(1, 30*time.Millisecond)
+
+	slot, ok := limiter.Acquire()
+	require_True(t, ok)
+
+	// Keep touching the slot faster than it would expire on its own.
+	deadline := time.Now().Add(80 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		limiter.Touch(slot)
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The slot should still be held: a fresh acquire must be denied.
+	_, ok = limiter.Acquire()
+	require_False(t, ok)
+}
+
+func TestNRGElectionConcurrencyLimiterNilForZeroMax(t *testing.T) {
+	require_True(t, newElectionConcurrencyLimiter(0, time.Second) == nil)
+	require_True(t, newElectionConcurrencyLimiter(-1, time.Second) == nil)
+	require_True(t, newElectionConcurrencyLimiter(-100, time.Second) == nil)
+}
+
+func TestNRGElectionConcurrencyLimiterConcurrentAccess(t *testing.T) {
+	limiter := newElectionConcurrencyLimiter(1000, time.Minute)
+	var wg sync.WaitGroup
+	acquired := int64(0)
+
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				if _, ok := limiter.Acquire(); ok {
+					atomic.AddInt64(&acquired, 1)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// 50 goroutines * 100 attempts = 5000 attempts against 1000 slots that
+	// are never released within this test, so exactly 1000 should succeed.
+	require_Equal(t, acquired, 1000)
+}

@@ -194,6 +194,7 @@ type Server struct {
 	dios                *diskIOSemaphore
 	isMetaLeader        atomic.Bool
 	jsClustered         atomic.Bool
+	electionLimiter     atomic.Pointer[electionConcurrencyLimiter]
 	accounts            sync.Map
 	tmpAccounts         sync.Map // Temporarily stores accounts that are being built
 	activeAccounts      int32

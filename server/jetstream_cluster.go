@@ -1262,6 +1262,17 @@ func (s *Server) enableJetStreamClustering() error {
 	}
 
 	s.Noticef("Starting JetStream cluster")
+
+	// Initialize the concurrent-election limiter if configured. Read-modify-write
+	// races here just mean two limiters get constructed and one is discarded;
+	// harmless, so a plain CompareAndSwap is enough (no s.mu needed).
+	if s.electionLimiter.Load() == nil {
+		lim := s.opts.JetStreamLimits
+		if cl := newElectionConcurrencyLimiter(lim.MaxConcurrentElections, lim.ElectionLease); cl != nil {
+			s.electionLimiter.CompareAndSwap(nil, cl)
+		}
+	}
+
 	// We need to determine if we have a stable cluster name and expected number of servers.
 	s.Debugf("JetStream cluster checking for stable cluster name and peers")
 
